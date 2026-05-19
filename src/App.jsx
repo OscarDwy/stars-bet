@@ -23,22 +23,26 @@ import { auth, db } from './firebase.js';
 
 const COTE_MIN_FACTOR = 0.7;
 const COTE_MAX_FACTOR = 1.3;
+const LIQUIDITY_BUFFER = 500; // Stars fictives par option pour stabiliser les cotes au début
 const RECHARGE_AMOUNT = 500;
 const RECHARGE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const INITIAL_STARS = 1000;
 
-// Convertit un pseudo en email factice pour Firebase Auth
-// (Firebase Auth exige un email, mais on cache ça à l'utilisateur)
 const pseudoToEmail = (pseudo) => `${pseudo.toLowerCase()}@starsbets.local`;
 
+// Cote effective avec buffer de liquidité :
+// On ajoute LIQUIDITY_BUFFER stars fictives à chaque option, qui se diluent
+// progressivement au fur et à mesure que les vraies mises s'accumulent.
 function computeEffectiveCote(bet, optionId) {
   const option = bet.options.find((o) => o.id === optionId);
   if (!option) return 1;
-  const totalStake = bet.options.reduce((s, o) => s + (o.totalStake || 0), 0);
-  if (totalStake === 0) return option.coteBase;
   const numOptions = bet.options.length;
+  // Mises virtuelles incluant le buffer
+  const virtualStakes = bet.options.map((o) => (o.totalStake || 0) + LIQUIDITY_BUFFER);
+  const totalVirtual = virtualStakes.reduce((a, b) => a + b, 0);
+  const optionVirtual = (option.totalStake || 0) + LIQUIDITY_BUFFER;
   const expectedShare = 1 / numOptions;
-  const actualShare = (option.totalStake || 0) / totalStake;
+  const actualShare = optionVirtual / totalVirtual;
   const ratio = actualShare / expectedShare;
   let factor;
   if (ratio >= 1) {
@@ -74,7 +78,6 @@ export default function App() {
     setTimeout(() => setToast(null), 3000);
   }, []);
 
-  // Surveille l'état d'auth
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
       setAuthUser(u);
@@ -90,7 +93,6 @@ export default function App() {
     return unsub;
   }, []);
 
-  // Écoute les paris en temps réel
   useEffect(() => {
     if (!authUser) return;
     const q = query(collection(db, 'bets'), orderBy('createdAt', 'desc'));
@@ -100,20 +102,17 @@ export default function App() {
     return unsub;
   }, [authUser]);
 
-  // Écoute tous les utilisateurs (pour le leaderboard)
   useEffect(() => {
     if (!authUser) return;
     const unsub = onSnapshot(collection(db, 'users'), (snap) => {
       const map = {};
       snap.docs.forEach((d) => { map[d.id] = { id: d.id, ...d.data() }; });
       setUsers(map);
-      // mettre à jour aussi le userDoc courant
       if (authUser && map[authUser.uid]) setUserDoc(map[authUser.uid]);
     });
     return unsub;
   }, [authUser]);
 
-  // Écoute le pseudo admin (config globale)
   useEffect(() => {
     if (!authUser) return;
     const unsub = onSnapshot(doc(db, 'config', 'admin'), (snap) => {
@@ -124,7 +123,6 @@ export default function App() {
 
   const isAdmin = userDoc && adminPseudo && userDoc.pseudo === adminPseudo;
 
-  // --- Auth ---
   const handleSignup = async (pseudo, password) => {
     pseudo = pseudo.trim();
     if (!pseudo || pseudo.length > 20) return showToast('Pseudo invalide (1-20 caractères)', 'danger');
@@ -132,7 +130,6 @@ export default function App() {
     if (password.length < 6) return showToast('Mot de passe : 6 caractères minimum', 'danger');
     try {
       const cred = await createUserWithEmailAndPassword(auth, pseudoToEmail(pseudo), password);
-      // Crée le user doc
       await setDoc(doc(db, 'users', cred.user.uid), {
         pseudo,
         stars: INITIAL_STARS,
@@ -142,7 +139,6 @@ export default function App() {
         totalWon: 0,
         createdAt: serverTimestamp(),
       });
-      // Premier compte = admin
       const adminConfig = await getDoc(doc(db, 'config', 'admin'));
       if (!adminConfig.exists()) {
         await setDoc(doc(db, 'config', 'admin'), { pseudo });
@@ -169,7 +165,6 @@ export default function App() {
 
   const handleLogout = () => signOut(auth);
 
-  // --- Recharge ---
   const handleRecharge = async () => {
     const now = Date.now();
     if (now - (userDoc.lastRecharge || 0) < RECHARGE_COOLDOWN_MS) {
@@ -183,7 +178,6 @@ export default function App() {
     showToast(`+${RECHARGE_AMOUNT} stars`, 'success');
   };
 
-  // --- Créer un pari ---
   const handleCreateBet = async (data) => {
     const bet = {
       title: data.title,
@@ -206,7 +200,6 @@ export default function App() {
     setActiveTab('bets');
   };
 
-  // --- Placer une mise (transaction pour éviter les race conditions) ---
   const handlePlaceBet = async (betId, optionId, amount) => {
     if (amount <= 0) return showToast('Mise invalide', 'danger');
     if (amount > userDoc.stars) return showToast('Pas assez de stars', 'danger');
@@ -245,7 +238,6 @@ export default function App() {
     }
   };
 
-  // --- Clôturer un pari et distribuer les gains ---
   const handleCloseBet = async (betId, winningOptionId) => {
     try {
       await runTransaction(db, async (tx) => {
@@ -255,7 +247,6 @@ export default function App() {
         const betData = betSnap.data();
         if (betData.status !== 'open') throw new Error('Déjà clôturé');
 
-        // Récupérer tous les users qui ont parié (lecture)
         const userIds = new Set();
         betData.options.forEach((opt) => (opt.bets || []).forEach((b) => userIds.add(b.userId)));
         const userSnaps = {};
@@ -264,7 +255,6 @@ export default function App() {
           userSnaps[uid] = { ref: r, snap: await tx.get(r) };
         }
 
-        // Calculer les modifications
         const userUpdates = {};
         userIds.forEach((uid) => {
           const data = userSnaps[uid].snap.data();
@@ -301,7 +291,6 @@ export default function App() {
           });
         });
 
-        // Écritures
         tx.update(betRef, {
           status: 'closed',
           winningOptionIds: [winningOptionId],
@@ -333,7 +322,6 @@ export default function App() {
     });
   };
 
-  // ----- Rendu -----
   if (loading) return <div className="container"><p>Chargement…</p></div>;
 
   if (!authUser || !userDoc) {
